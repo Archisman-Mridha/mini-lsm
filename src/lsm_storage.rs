@@ -15,6 +15,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
@@ -82,18 +83,7 @@ impl LsmStorageOptions {
 }
 
 /// The storage interface of the LSM tree.
-//
-// TODO : Why do we need to use Arc wrappers both at the field and at the struct level.
 pub(crate) struct LsmStorageInner {
-    // why we define the LsmStorageInner::state as type Arc<RwLock<Arc<LsmStorageState>>>? Why not
-    // make it Arc<RwLock<LsmStorageState>>? Multiple threads want to access to the state but it
-    // seems that Arc<RwLock<>> is enough. Sorry if the question seems newbie-ish.
-    //
-    // There are places where we use the read lock to get a reference to the state and then drop
-    // the read lock immediately to avoid contention. That’s not possible without Arc in the RwLock.
-    //
-    // REFERENCE :
-    // https://discord.com/channels/1197355762297610260/1197435686370947112/1272174110344089662.
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
@@ -245,10 +235,6 @@ impl LsmStorageInner {
             let guard = self.state.read();
             guard.memtable.put(key, value)?;
             size = guard.memtable.approximate_size();
-
-            // NOTE : We drop the read-lock guard here to avoid contention.
-            //        And then we try to freeze the current mutable memtable, if the size limit
-            //        has been reached.
         }
 
         self.try_freeze(size)?;
@@ -274,20 +260,7 @@ impl LsmStorageInner {
 
     fn try_freeze(&self, estimated_size: usize) -> Result<()> {
         if estimated_size >= self.options.target_sst_size {
-            let state_lock = self.state_lock.lock(); // Thread 2 which after doing a put operation,
-                                                     // has also found that the approximate size of
-                                                     // the current mutable memtable has got out of
-                                                     // bound, is waiting to get the state_lock.
-                                                     // It'll get ownership of the state_lock only
-                                                     // after this thread (Thread 1) has finished
-                                                     // freezing the current mutable memtable.
-                                                     //
-                                                     // NOTE : Other threads can still do get( ),
-                                                     // put( ) and delete( ) operations on the
-                                                     // mutable memtable, sine we haven't taken any
-                                                     // write lock to that.
-                                                     // We hold the write lock to that for a very
-                                                     // very short time.
+            let state_lock = self.state_lock.lock();
             let guard = self.state.read();
             // the memtable could have already been frozen, check again to ensure we really need to freeze
             if guard.memtable.approximate_size() >= self.options.target_sst_size {
@@ -325,37 +298,7 @@ impl LsmStorageInner {
 
         let old_memtable;
         {
-            let mut guard = self.state.write(); // Here we finally take a write lock to the mutable
-                                                // memtable for as short time as possible.
-                                                // So other threads can't do any get( ), put( ) or
-                                                // delete( ) operations, while we're freezing the
-                                                // current mutable memtable.
-                                                // NOTE : We create the new memtable and WAL file
-                                                // (which is an I/O operation) before taking the
-                                                // write lock.
-
-            // guard is RWLockWriteGuard<Arc<LSMStorageState>>. When you do guard.as_ref( ), it
-            // boils down through the Arc<> and spits out a cloned new LSMStorageState { }.
-            //
-            // NOTE : We have a new LSMStorageState { } struct now (snapshot), but the fields inside
-            //        LSMStorageState which were wrapped in Arc, weren't actually cloned.
-            //
-            // We do mutations in this new LSMStorageState { } struct (snapshot) and then point the
-            // RWLockWriteGuard to this new struct.
-            //
-            // Why do we need to do it like this?
-            // Check this Arc example out : https://doc.rust-lang.org/rust-by-example/std/arc.html.
-            // If we have Arc<T> and we want to mutate T, we need to do :
-            //
-            //    (1) new T = Arc<T>.clone( ).
-            //
-            //    (2) mutate the new T.
-            //
-            // That's exactly what we're doing here.
-            //
-            // And also, this is an infrequent operation, since it takes time for a mutable
-            // memtable to hit the size limit.
-
+            let mut guard = self.state.write();
             // Swap the current memtable with a new one.
             let mut snapshot = guard.as_ref().clone();
             old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
@@ -376,9 +319,20 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        }; // drop global lock here
+
+        let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+        memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
+        for memtable in snapshot.imm_memtables.iter() {
+            memtable_iters.push(Box::new(memtable.scan(lower, upper)));
+        }
+        let iter = MergeIterator::create(memtable_iters);
+        Ok(FusedIterator::new(LsmIterator::new(iter)?))
     }
 }
